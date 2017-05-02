@@ -3,6 +3,7 @@ package commands
 import (
     "time"
     "archive/zip"
+    "errors"
     "bytes"
     "crypto/md5"
     "encoding/hex"
@@ -16,7 +17,6 @@ import (
     "strings"
     "regexp"
     "gopkg.in/urfave/cli.v1"
-
     "github.com/oddnetworks/roku-cli/rc"
 )
 
@@ -26,6 +26,45 @@ var allowedPaths []string = []string{"manifest", "source", "images", "components
 type authorization struct {
     Username, Password, Realm, NONCE, QOP, Opaque, Algorithm string
 }
+
+func (as *authorization) digest(method string, url string) (string, error) {
+    config, _ := rc.LoadRC()
+    device := config.CurrentDevice()
+    login := strings.Join([]string{as.Username, as.Realm, as.Password}, ":")
+    h := md5.New()
+    io.WriteString(h, login)
+    loginHash := hex.EncodeToString(h.Sum(nil))
+    if method!="GET" && method!="POST" {
+        return "", errors.New("only GET and POST methods supported")
+    }
+    auth := &authorization{"rokudev", device.Password, "rokudev", "", "auth", "", ""}
+    action := strings.Join([]string{method, url}, ":")
+    h = md5.New()
+    io.WriteString(h, action)
+    actionHash := hex.EncodeToString(h.Sum(nil))
+
+    nc_str := fmt.Sprintf("%08x", 3)
+    hnc := "MTM3MDgw"
+
+    responseDigest := fmt.Sprintf("%s:%s:%s:%s:%s:%s", loginHash, as.NONCE, nc_str, hnc, as.QOP, actionHash)
+    h = md5.New()
+    io.WriteString(h, responseDigest)
+    responseDigest = hex.EncodeToString(h.Sum(nil))
+
+    digest := "username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\""
+    digest = fmt.Sprintf(digest, as.Username, as.Realm, as.NONCE, url, responseDigest)
+    if auth.Opaque != "" {
+        digest += fmt.Sprintf(", opaque=\"%s\"", as.Opaque)
+    }
+    if auth.QOP != "" {
+        digest += fmt.Sprintf(", qop=\"%s\", nc=%s, cnonce=\"%s\"", as.QOP, nc_str, hnc)
+    }
+    if auth.Algorithm != "" {
+        digest += fmt.Sprintf(", algorithm=\"%s\"", as.Algorithm)
+    }
+    return digest, nil
+}
+
 
 func EnsurePaths(c *cli.Context) error {
     if FS.Source == "" {
@@ -60,7 +99,22 @@ func EnsurePaths(c *cli.Context) error {
     return nil
 }
 
+// return True if any file in FS.Source modification time > destination zip file modification time
+
+func IsSourceChanges() bool {
+    return false
+}
+
+func ZipContainsAll() bool {
+    return false
+}
+
 func Build(c *cli.Context) error {
+    // TODO:
+    if !IsSourceChanges() && ZipContainsAll() {
+        fmt.Println("Build: source not changes")
+        return nil
+    }
     // Make a new file handler and zip archive
     zipFile, err := os.Create(FS.Zip)
     if err != nil {
@@ -75,7 +129,7 @@ func Build(c *cli.Context) error {
 
     roots, err := ioutil.ReadDir(FS.Source)
 
-    fmt.Printf("roots: %+v\n", roots)
+    // fmt.Printf("roots: %+v\n", roots)
     for _, r := range roots {
         for _, allowed := range allowedPaths {
             if strings.Contains(r.Name(), allowed) {
@@ -90,7 +144,7 @@ func Build(c *cli.Context) error {
                             if err != nil {
                                 return err
                             }
-                            fmt.Printf("compress %s [%+v]\n", path, allowedPaths)
+                            // fmt.Printf("compress %s [%+v]\n", path, allowedPaths)
                             header.Name = strings.TrimPrefix(path, FS.Source+"/")
 
                             header.Method = zip.Store
@@ -196,8 +250,7 @@ func Install(c *cli.Context) error {
     if auth.Algorithm != "" {
         digest += fmt.Sprintf(", algorithm=\"%s\"", auth.Algorithm)
     }
-    // fmt.Printf("working auth: '%s'",digest)
-    // Post the form with the digest auth to the Roku device
+
     req, err := http.NewRequest("POST", "http://"+device.IP+"/plugin_install", form)
     req.Header.Set("Content-Type", writer.FormDataContentType())
     req.Header.Set("Authorization", "Digest "+digest)
@@ -227,17 +280,18 @@ func Install(c *cli.Context) error {
 }
 
 func Package(c *cli.Context) error {
-    // err := Build(c)
-    // if err != nil {
-    //    return err
-    // }
+
+    err := Build(c)
+    if err != nil {
+        return err
+    }
 
     // Open the rc file and get the current device
     config, _ := rc.LoadRC()
     device := config.CurrentDevice()
 
     // Open the zip file
-    zip, err := os.Open(FS.Zip)
+    zip, err := os.Open(FS.Destination)
     if err != nil {
         return cli.NewExitError("Error reading zip file: "+err.Error(), 1)
     }
@@ -370,6 +424,8 @@ func Download(c *cli.Context, url string) error {
     if auth.Algorithm != "" {
         digest += fmt.Sprintf(", algorithm=\"%s\"", auth.Algorithm)
     }
+
+    // -- end authorization_struct digest --
     // fmt.Printf("working auth: '%s'\n",digest)
     // Post the form with the digest auth to the Roku device
     // fullUrl := "http://"+device.IP+"/" + url
